@@ -10,7 +10,6 @@ for:
 -
   matrix:
     only:
-#    - NAME: gpu-opencl
     - NAME: cpu-dnnl
   skip_non_tags: true
 clone_folder: c:\projects\lc0
