@@ -46,11 +46,23 @@ The CUDA backend's behavior depends on its configuration:
 
 The ONNX backend involves an intermediate step of converting Lc0's native weight format to an ONNX model:
 
-- Weights (including RPE) are first loaded and dequantized to 32-bit floats as described above.
-- These 32-bit float weights are then used by the `ConvertWeightsToOnnx` utility to create an ONNX model.
-- The ONNX model itself can be configured to store its weights in **fp32, fp16, or bf16 (BFloat16)** precision, depending on the options provided during conversion (e.g., `--fp16` flag for the `lc0` command or backend options).
-- The ONNX Runtime then executes this ONNX model. The precision of computation will match the precision of the weights within the generated ONNX model.
-- The conversion path is: 16-bit quantized (file) -> 32-bit float (initial load) -> fp32/fp16/bf16 (weights in the ONNX model) -> computation by ONNX Runtime at that model precision.
+-   Weights (including RPE) are first loaded and dequantized to 32-bit floats as described in the "Weight Storage in `.pb` Files" section.
+-   These 32-bit float weights are then used by the `ConvertWeightsToOnnx` utility to create an ONNX model. The ONNX model itself can be configured to store its weights in **fp32, fp16, or bf16 (BFloat16)** precision, depending on the options provided during conversion (e.g., the `datatype` backend option or older `--fp16` command-line flags).
+-   The ONNX Runtime then executes this ONNX model. Generally, the precision of computation will match the precision of the weights within the generated ONNX model, especially when using GPU execution providers (like CUDA or DirectML) that have robust support for lower precision.
+
+**Note on ONNX Runtime CPU Execution Provider:**
+
+A specific consideration arises when using ONNX Runtime with its CPU Execution Provider (CPU EP). While the ONNX model file may have its weights stored at a lower precision like fp16:
+
+-   The ONNX Runtime's CPU EP might, in some circumstances, internally execute certain operations or parts of the graph at a higher precision (typically fp32). This can occur for various reasons, including:
+    -   Lack of a native, stable, or performant fp16/bf16 kernel for a specific operator or a particular configuration of an operator on the CPU.
+    -   To ensure numerical stability or correctness for certain mathematical functions when implemented on general-purpose CPUs.
+    -   Operations involving constants (e.g., some matrix multiplications where one input is a constant weight tensor) might be handled by CPU kernels that prefer fp32.
+-   This behavior is internal to ONNX Runtime and depends on its version and the specifics of its CPU EP implementation. It means that even if your `.onnx` model's weights are, for example, fp16, some computations during CPU inference might still effectively happen in fp32.
+
+Lc0's ONNX converter also has some internal logic for specific cases. For instance, when converting to BFloat16 with an ONNX opset older than 22, Lc0 might wrap certain operations (like `Conv`) with casts to fp32 and back to BFloat16. This is a workaround within Lc0's converter for limited BFloat16 operator support in those older opsets and is distinct from the general behavior of ONNX Runtime's CPU EP.
+
+Therefore, the path for ONNX is: 16-bit quantized (file) -> 32-bit float (initial Lc0 load) -> fp32/fp16/bf16 (weights in the `.onnx` model file) -> computation by ONNX Runtime, where the actual operational precision for some parts on CPU might default to fp32 irrespective of the model's weight precision.
 
 ## Relative Positional Encoding (RPE) Precision
 
