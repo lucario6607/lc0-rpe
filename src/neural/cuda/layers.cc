@@ -1713,11 +1713,11 @@ EncoderBlock<DataType>::EncoderBlock(
                             rpe_scratch, mha_q_size_, 0.0f, (DataType*)scratch,
                             4096);
 
-      // Permute RPE Q weights: [D, H, Q, K] -> [H, Q, K, D]
+      // Permute RPE Q weights: [D, H, Q, K] -> [Q, H, K, D]
       ReportCUDAErrors(
           cudaMalloc(&mha_rpe_q, mha_q_size_ * 4096 * sizeof(DataType)));
       permuteTensor((DataType*)mha_rpe_q, (const DataType*)scratch, depth,
-                    heads, 64, 64, 1, 2, 3, 0, 0);
+                    heads, 64, 64, 2, 1, 3, 0, 0);
     }
     if (mha_rpe_k_size_ > 0) {
       allocAndUpload<DataType>(&rpe_scratch, cpu_weights.mha.rpe_k, scratch);
@@ -1728,11 +1728,11 @@ EncoderBlock<DataType>::EncoderBlock(
                             rpe_scratch, mha_k_size_, 0.0f, (DataType*)scratch,
                             4096);
 
-      // Permute RPE K weights: [D, H, Q, K] -> [H, K, Q, D]
+      // Permute RPE K weights: [D, H, Q, K] -> [K, H, Q, D]
       ReportCUDAErrors(
           cudaMalloc(&mha_rpe_k, mha_k_size_ * 4096 * sizeof(DataType)));
       permuteTensor((DataType*)mha_rpe_k, (const DataType*)scratch, depth,
-                    heads, 64, 64, 1, 3, 2, 0, 0);
+                    heads, 64, 64, 3, 1, 2, 0, 0);
     }
     if (mha_rpe_v_size_ > 0) {
       allocAndUpload<DataType>(&rpe_scratch, cpu_weights.mha.rpe_v, scratch);
@@ -1993,7 +1993,7 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     // Kernel performs the required transpositions.
     // The matmul result (buffer2) is already with BQHD shape.
     multiplyRPEAttentionLogits<DataType>(cublas, buffer1, mha_rpe_v, buffer2,
-                                         buffer2, nullptr, N, encoder_heads_,
+                                         buffer2, (DataType*)scratch, N, encoder_heads_,
                                          64, 64, depth, 1.0f, 2, stream);
   }
 
