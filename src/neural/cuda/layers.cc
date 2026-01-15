@@ -1728,11 +1728,17 @@ EncoderBlock<DataType>::EncoderBlock(
                             rpe_scratch, mha_k_size_, 0.0f, (DataType*)scratch,
                             4096);
 
-      // Permute RPE K weights: [D, H, Q, K] -> [K, H, Q, D]
+      // Permute RPE K weights: [D, H, Q, K] -> [H, Q, K, D]
       ReportCUDAErrors(
           cudaMalloc(&mha_rpe_k, mha_k_size_ * 4096 * sizeof(DataType)));
       permuteTensor((DataType*)mha_rpe_k, (const DataType*)scratch, depth,
-                    heads, 64, 64, 3, 1, 2, 0, 0);
+                    heads, 64, 64, 1, 2, 3, 0, 0);
+
+      // Allocate pointers for RPE K Batched GEMM.
+      int total_ptr = heads * 64 * 64;
+      ReportCUDAErrors(cudaMalloc((void**)&rpe_k_ptr_A, total_ptr * sizeof(DataType*)));
+      ReportCUDAErrors(cudaMalloc((void**)&rpe_k_ptr_B, total_ptr * sizeof(DataType*)));
+      ReportCUDAErrors(cudaMalloc((void**)&rpe_k_ptr_C, total_ptr * sizeof(DataType*)));
     }
     if (mha_rpe_v_size_ > 0) {
       allocAndUpload<DataType>(&rpe_scratch, cpu_weights.mha.rpe_v, scratch);
@@ -1931,7 +1937,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       multiplyRpeQKLogits<DataType>(cublas, mha_q, mha_rpe_q, mha_k, mha_rpe_k,
                                     buffer1, buffer1, buffer2, N,
                                     encoder_heads_, 64, 64, depth, factor,
-                                    stream);
+                                    stream, rpe_k_ptr_A, rpe_k_ptr_B,
+                                    rpe_k_ptr_C);
     } else {
       // RPE Q.
       if (mha_rpe_q_size_ > 0) {
@@ -1952,7 +1959,8 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         // Kernel performs the required transpositions.
         multiplyRPEAttentionLogits<DataType>(
             cublas, mha_k, mha_rpe_k, buffer1, buffer1, buffer2, N,
-            encoder_heads_, 64, 64, depth, factor, 1, stream);
+            encoder_heads_, 64, 64, depth, factor, 1, stream, rpe_k_ptr_A,
+            rpe_k_ptr_B, rpe_k_ptr_C);
       }
     }
   }
@@ -2157,6 +2165,11 @@ EncoderBlock<DataType>::~EncoderBlock() {
   ReportCUDAErrors(cudaFree(ffn_dense2_b));
   ReportCUDAErrors(cudaFree(ln2_gammas));
   ReportCUDAErrors(cudaFree(ln2_betas));
+  if (mha_rpe_k_size_ > 0) {
+    ReportCUDAErrors(cudaFree(rpe_k_ptr_A));
+    ReportCUDAErrors(cudaFree(rpe_k_ptr_B));
+    ReportCUDAErrors(cudaFree(rpe_k_ptr_C));
+  }
   if (has_smolgen_) {
     ReportCUDAErrors(cudaFree(smol_compress));
     ReportCUDAErrors(cudaFree(smol_dense1_w));

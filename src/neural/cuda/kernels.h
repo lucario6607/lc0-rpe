@@ -159,18 +159,26 @@ void applyInputGating(T* output, const T* input, const T* mult, const T* add,
                       int N, int HW, int C, cudaStream_t stream);
 
 template <typename T>
+void generateRpeKPointers(const T* rpeWeights, const T* rpeInput, T* output,
+                          const T** ptrA, const T** ptrB, T** ptrC, int H,
+                          int Q, int K, int D, int N, cudaStream_t stream);
+
+template <typename T>
 void multiplyRPEAttentionLogits(cublasHandle_t handle, const T* rpeInput,
                                 const T* rpeWeights, const T* attnInput,
                                 T* output, T* scratch, int B, int H, int Q,
                                 int K, int D, float outScale, size_t rpetype,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const T** ptrA = nullptr,
+                                const T** ptrB = nullptr, T** ptrC = nullptr);
 
 template <typename T>
 void multiplyRpeQKLogits(cublasHandle_t handle, const T* rpeInputQ,
                          const T* rpeWeightsQ, const T* rpeInputK,
                          const T* rpeWeightsK, const T* attnInput, T* output,
                          T* scratch, int B, int H, int Q, int K, int D,
-                         float outScale, cudaStream_t stream);
+                         float outScale, cudaStream_t stream,
+                         const T** ptrA = nullptr, const T** ptrB = nullptr,
+                         T** ptrC = nullptr);
 
 template <typename T>
 void permuteTensor(T* output, const T* input, int s1, int s2, int s3, int s4,

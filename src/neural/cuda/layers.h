@@ -356,6 +356,10 @@ class EncoderBlock {
   DataType *mha_rpe_q, *mha_rpe_k, *mha_rpe_v;
   DataType *mha_rpe_factorizer;
 
+  const DataType **rpe_k_ptr_A;
+  const DataType **rpe_k_ptr_B;
+  DataType **rpe_k_ptr_C;
+
   DataType *ln1_gammas, *ln1_betas;
 
   DataType *ffn_dense1_w, *ffn_dense1_b;
