@@ -31,6 +31,7 @@
 #include "cuda_common.h"
 #include "neural/shared/activation.h"
 #include "neural/shared/attention_policy_map.h"
+#include "utils/fp16_utils.h"
 #include "winograd_helper.inc"
 
 namespace lczero {
@@ -1311,386 +1312,124 @@ void applyInputGating(T* output, const T* input, const T* mult, const T* add,
   ReportCUDAErrors(cudaGetLastError());
 }
 
-// Get the index corresponding to position (i,j,k,l) in a tensor
-// with dimensions (I,J,K,L) where the innermost dimension is L.
-__device__ __forceinline__ int getTensorIndex(int i, int j, int k, int l, int I,
-                                              int J, int K, int L) {
-  if (i >= I || j >= J || k >= K || l >= L) return -1;
-
-  return (((((i * J) + j) * K) + k) * L) + l;
-
-  // int index;
-  // index = i;
-  // index *= J;
-  // index += j;
-  // index *= K;
-  // index += k;
-  // index *= L;
-  // index += l;
-
-  // return index;
-}
-
-template <typename dT, typename sT = dT>
-__device__ __forceinline__ dT readInputTensor(const sT* input_tensor, size_t i,
-                                              size_t j, size_t k, size_t l,
-                                              size_t I, size_t J, size_t K,
-                                              size_t L) {
-  // i is the outermost|slowest|most-significant index, while l is the
-  // innermost|fastest|least-significant index.
-  if (i >= I || j >= J || k >= K || l >= L) return 0;
-
-  // int index;
-  // index = i;
-  // index *= J;
-  // index += j;
-  // index *= K;
-  // index += k;
-  // index *= L;
-  // index += l;
-  // int index = getTensorIndex(i, j, k, l, I, J, K, L);
-  size_t index = (((((i * J) + j) * K) + k) * L) + l;
-
-  return (dT)(input_tensor[index]);
-}
-
-__device__ __forceinline__ float sharedDotProductSum(float val, int x, int y) {
-  // Sum is done along the x-axis, while y is the accumulator.
-  int warpPos = y % 32;
-  __shared__ float partialSum[32];
-  if (x == 0) partialSum[warpPos] = 0.0f;
-
-  __syncthreads();
-
-  // Get warp-wide sum.
-  float warpSum = warpReduce(val);
-  if (x == 0) atomicAdd(&partialSum[warpPos], warpSum);
-
-  __syncthreads();
-
-  return partialSum[warpPos];
-}
-
 template <typename T>
-__global__ void rpeVectorMultiply_parallel_kernel(
-    const T* rpeInput, const T* rpeWeights, const T* skipAdd, T* output, int B,
-    int H, int Q, int K, int D, float outScale, size_t rpetype) {
-  int x = threadIdx.x;
-  int y = threadIdx.y + blockDim.y * blockIdx.y;
-  int z = threadIdx.z + blockDim.z * blockIdx.z;
-  int h = z % H;
-  z = z / H;
-  int q = z % Q;
-  z = z / Q;
-  int b = z % B;
-
-  if (rpetype == 0) {
-    // RPE-Q
-    // rpeInput:   [B, Q, H, D] -> transpose to [B, H, Q, (1, D)]
-    // rpeWeights: [H, Q, K, D] -> transpose to [1, H, Q, (D, K)]
-    // output:     [B, H, Q, K]
-
-    // Read tensors per the input layouts and write out per the output layout.
-    // Sum is along the D dimension, and K is on the x-axis.
-    // Each thread handles one product of the sum. Thread 0 sums the products.
-    int d = x;
-    int k = y;
-    if (b >= B || h >= H || q >= Q || k >= K || d >= D) return;
-
-    const int tensorIndex = getTensorIndex(b, q, h, d, B, Q, H, D);
-    const int weightIndex = getTensorIndex(h, q, k, d, H, Q, K, D);
-
-    T sum = (T)sharedDotProductSum(
-        (float)rpeInput[tensorIndex] * (float)rpeWeights[weightIndex], x, y);
-
-    if (d == 0) {
-      int outIdx = getTensorIndex(b, h, q, k, B, H, Q, K);
-      output[outIdx] = (sum + (T)skipAdd[outIdx]) * (T)outScale;
-    }
-  } else if (rpetype == 1) {
-    // RPE-K
-    // rpeInput:   [B, K, H, D] -> transpose to [B, H, K, (1, D)]
-    // rpeWeights: [H, K, Q, D] -> transpose to [1, H, K, (D, Q)]
-    // output:     [B, H, Q, K]
-
-    // Read tensors per the input layouts and write out per the output layout.
-    // Sum is along the D dimension, and K is on the x-axis.
-    // Each thread handles one product of the sum. Thread 0 sums the products.
-    int d = x;
-    int k = y;
-    if (b >= B || h >= H || q >= Q || k >= K || d >= D) return;
-
-    const int tensorIndex = getTensorIndex(b, k, h, d, B, K, H, D);
-    const int weightIndex = getTensorIndex(h, k, q, d, H, K, Q, D);
-
-    T sum = (T)sharedDotProductSum(
-        (float)rpeInput[tensorIndex] * (float)rpeWeights[weightIndex], x, y);
-
-    if (d == 0) {
-      int outIdx = getTensorIndex(b, h, q, k, B, H, Q, K);
-      output[outIdx] = (sum + (T)skipAdd[outIdx]) * (T)outScale;
-    }
-  } else if (rpetype == 2) {
-    // RPE-V
-    // rpeInput:   [B, H, Q, K] -> transpose to [B, H, Q, (1, K)]
-    // rpeWeights: [H, Q, D, K] -> transpose to [1, H, Q, (K, D)]
-    // output:     [B, Q, H, D]
-    // The skip connection is also already in BQHD order.
-
-    // Read tensors per the input layouts and write out per the output layout.
-    // Sum is along the K dimension, and D is on the x-axis.
-    int k = x;
-    int d = y;
-    if (b >= B || h >= H || q >= Q || k >= K || d >= D) return;
-
-    const int tensorIndex = getTensorIndex(b, h, q, k, B, H, Q, K);
-    const int weightIndex = getTensorIndex(h, q, d, k, H, Q, D, K);
-
-    T sum = (T)sharedDotProductSum(
-        (float)rpeInput[tensorIndex] * (float)rpeWeights[weightIndex], x, y);
-
-    if (k == 0) {
-      int outIdx = getTensorIndex(b, q, h, d, B, Q, H, D);
-      output[outIdx] = (sum + (T)skipAdd[outIdx]) * (T)outScale;
-    }
-  }
-}
-
-template <typename T>
-__device__ __forceinline__ T dotProductSum(int x, const T* U, const T* V,
-                                           int length, bool fp16) {
-  assert(length >= 16);
-  T sum = 0;
-  int sublen = length / kNumRpeKernelSplits;
-  int lane = x & (kNumRpeKernelSplits - 1);
-  int start = lane * sublen;
-
-  // Load from memory (16 elements a time)
+void cublasXGemmStridedBatched(cublasHandle_t handle, cublasOperation_t transa,
+                               cublasOperation_t transb, int m, int n, int k,
+                               float alpha, const T* A, int lda,
+                               long long int strideA, const T* B, int ldb,
+                               long long int strideB, float beta, T* C, int ldc,
+                               long long int strideC, int batchCount) {
+  const bool fp16 = std::is_same<half, T>::value;
   if (fp16) {
-    half u[8];
-    half v[8];
-#pragma unroll
-    for (int h = start; h < start + sublen; h += 8) {
-      copyAs<uint4>(&u[0], &U[h]);
-      copyAs<uint4>(&v[0], &V[h]);
-#pragma unroll
-      for (int i = 0; i < 8; i++) {
-        sum += (T)u[i] * (T)v[i];
-      }
-    }
+    ReportCUBLASErrors(cublasGemmStridedBatchedEx(
+        handle, transa, transb, m, n, k, &alpha, A, CUDA_R_16F, lda, strideA, B,
+        CUDA_R_16F, ldb, strideB, &beta, C, CUDA_R_16F, ldc, strideC,
+        batchCount, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
   } else {
-    float u[4];
-    float v[4];
-#pragma unroll
-    for (int h = start; h < start + sublen; h += 4) {
-      copyAs<uint4>(&u[0], &U[h]);
-      copyAs<uint4>(&v[0], &V[h]);
-#pragma unroll
-      for (int i = 0; i < 4; i++) {
-        sum += (T)u[i] * (T)v[i];
-      }
-    }
+    ReportCUBLASErrors(cublasGemmStridedBatchedEx(
+        handle, transa, transb, m, n, k, &alpha, A, CUDA_R_32F, lda, strideA, B,
+        CUDA_R_32F, ldb, strideB, &beta, C, CUDA_R_32F, ldc, strideC,
+        batchCount, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
   }
-
-  // Warp-level reduction to sum up adjacent threads.
-  __syncwarp();
-#pragma unroll
-  for (int i = 1; i < kNumRpeKernelSplits; i = i << 1) {
-    sum += __shfl_down_sync(0xffffffff, sum, i);
-  }
-  return sum;
 }
 
 template <typename T>
-__global__ void rpeVectorMultiply_kernel(const T* rpeInput, const T* rpeWeights,
-                                         const T* skipAdd, T* output, int B,
-                                         int H, int Q, int K, int D,
-                                         float outScale, size_t rpetype) {
-  const int x = threadIdx.x + blockDim.x * blockIdx.x;
-  const int q = threadIdx.y + blockDim.y * blockIdx.y;
-  const int bh = threadIdx.z + blockDim.z * blockIdx.z;
-  const int h = bh % H;
-  const int b = bh / H;
-  const bool fp16 = std::is_same<half, T>::value;
-  const int lane = x & (kNumRpeKernelSplits - 1);
+__global__ void permuteAndAdd_kernel(T* output, const T* input, int s1, int s2,
+                                     int s3, int s4, int p1, int p2, int p3,
+                                     int p4, float scale) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int elements = s1 * s2 * s3 * s4;
+  if (tid >= elements) return;
 
+  int tloc[] = {0, 0, 0, 0};
+  int index = tid;
+
+  tloc[3] = (index % s4);
+  index /= s4;
+  tloc[2] = index % s3;
+  index /= s3;
+  tloc[1] = index % s2;
+  index /= s2;
+  tloc[0] = index;
+
+  int tshp[] = {s1, s2, s3, s4};
+
+  int outIdx = (((((tloc[p1] * tshp[p2]) + tloc[p2]) * tshp[p3]) + tloc[p3]) *
+                tshp[p4]) +
+               tloc[p4];
+
+  float val = (float)input[tid];
+  float outVal = (float)output[outIdx];
+  output[outIdx] = (T)(outVal + val * scale);
+}
+
+template <typename T>
+void permuteAndAdd(T* output, const T* input, int s1, int s2, int s3, int s4,
+                   int p1, int p2, int p3, int p4, float scale,
+                   cudaStream_t stream) {
+  int elements = s1 * s2 * s3 * s4;
+  const int kBlockSize = 256;
+  int blocks = DivUp(elements, kBlockSize);
+
+  permuteAndAdd_kernel<<<blocks, kBlockSize, 0, stream>>>(
+      output, input, s1, s2, s3, s4, p1, p2, p3, p4, scale);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+template <typename T>
+void multiplyRPEAttentionLogits(cublasHandle_t handle, const T* rpeInput,
+                                const T* rpeWeights, const T* attnInput,
+                                T* output, T* scratch, int B, int H, int Q,
+                                int K, int D, float outScale, size_t rpetype,
+                                cudaStream_t stream) {
   if (rpetype == 0) {
-    // RPE-Q
-    // rpeInput:   [B, Q, H, D] -> transpose to [B, H, Q, (1, D)]
-    // rpeWeights: [H, Q, K, D] -> transpose to [1, H, Q, (D, K)]
-    // output:     [B, H, Q, K]
+    for (int q = 0; q < Q; q++) {
+      const T* A_ptr = rpeInput + q * H * D;
+      const T* B_ptr = rpeWeights + q * K * D;
+      T* C_ptr = output + q * K;
 
-    // Read tensors per the input layouts and write out per the output layout.
-    // Sum is along the D dimension, and K is on the x-axis.
-    int k = x / kNumRpeKernelSplits;
-    if (b >= B || h >= H || q >= Q || k >= K) return;
-
-    const int tensorIndex = getTensorIndex(b, q, h, 0, B, Q, H, D);
-    const int weightIndex = getTensorIndex(h, q, k, 0, H, Q, K, D);
-
-    T sum = dotProductSum(x, rpeInput + tensorIndex, rpeWeights + weightIndex,
-                          D, fp16);
-
-    if (lane == 0) {
-      int outIdx = getTensorIndex(b, h, q, k, B, H, Q, K);
-      output[outIdx] = ((T)sum + (T)skipAdd[outIdx]) * (T)outScale;
-    }
-  } else if (rpetype == 1) {
-    // RPE-K
-    // rpeInput:   [B, K, H, D] -> transpose to [B, H, K, (1, D)]
-    // rpeWeights: [H, K, Q, D] -> transpose to [1, H, K, (D, Q)]
-    // output:     [B, H, Q, K]
-
-    // Read tensors per the input layouts and write out per the output layout.
-    // Sum is along the D dimension, and K is on the x-axis.
-    int k = x / kNumRpeKernelSplits;
-    if (b >= B || h >= H || q >= Q || k >= K) return;
-
-    const int tensorIndex = getTensorIndex(b, k, h, 0, B, K, H, D);
-    const int weightIndex = getTensorIndex(h, k, q, 0, H, K, Q, D);
-    T sum = dotProductSum(x, rpeInput + tensorIndex, rpeWeights + weightIndex,
-                          D, fp16);
-    if (lane == 0) {
-      int outIdx = getTensorIndex(b, h, q, k, B, H, Q, K);
-      output[outIdx] = ((T)sum + (T)skipAdd[outIdx]) * (T)outScale;
+      cublasXGemmStridedBatched<T>(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N, K, B, D, outScale, B_ptr, D,
+          (long long)Q * K * D, A_ptr, (long long)Q * H * D, D, outScale, C_ptr,
+          (long long)H * Q * K, (long long)Q * K, H);
     }
   } else if (rpetype == 2) {
-    // RPE-V
-    // rpeInput:   [B, H, Q, K] -> transpose to [B, H, Q, (1, K)]
-    // rpeWeights: [H, Q, D, K] -> transpose to [1, H, Q, (K, D)]
-    // output:     [B, Q, H, D]
-    // The skip connection is also already in BQHD order.
+    for (int q = 0; q < Q; q++) {
+      const T* A_ptr = rpeInput + q * K;
+      const T* B_ptr = rpeWeights + q * D * K;
+      T* C_ptr = output + q * H * D;
 
-    // Read tensors per the input layouts and write out per the output layout.
-    // Sum is along the K dimension, and D is on the x-axis.
-    int d = x / kNumRpeKernelSplits;
-    if (b >= B || h >= H || q >= Q || d >= D) return;
-
-    const int tensorIndex = getTensorIndex(b, h, q, 0, B, H, Q, K);
-    const int weightIndex = getTensorIndex(h, q, d, 0, H, Q, D, K);
-    T sum = dotProductSum(x, rpeInput + tensorIndex, rpeWeights + weightIndex,
-                          K, fp16);
-    if (lane == 0) {
-      int outIdx = getTensorIndex(b, q, h, d, B, Q, H, D);
-      output[outIdx] = ((T)sum + (T)skipAdd[outIdx]) * (T)outScale;
+      cublasXGemmStridedBatched<T>(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N, D, B, K, outScale, B_ptr, K,
+          (long long)Q * D * K, A_ptr, (long long)H * Q * K, (long long)Q * K,
+          outScale, C_ptr, (long long)Q * H * D, D, H);
     }
+  } else if (rpetype == 1) {
+    for (int h = 0; h < H; h++) {
+      const T* A_ptr = rpeInput + h * D;
+      const T* B_ptr = rpeWeights + h * K * Q * D;
+      T* C_ptr = scratch + h * K * B * Q;
+
+      cublasXGemmStridedBatched<T>(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N, Q, B, D, 1.0f, B_ptr, D,
+          (long long)Q * D, A_ptr, (long long)K * H * D, (long long)H * D, 0.0f,
+          C_ptr, Q, (long long)B * Q, K);
+    }
+
+    permuteAndAdd(output, scratch, H, K, B, Q, 2, 0, 3, 1, outScale, stream);
   }
 }
 
 template <typename T>
-void multiplyRPEAttentionLogits(const T* rpeInput, const T* rpeWeights,
-                                const T* attnInput, T* output, int B, int H,
-                                int Q, int K, int D, float outScale,
-                                size_t rpetype, cudaStream_t stream) {
-  if (rpetype > 2) {
-    throw Exception("unsupported rpetype in multiplyRPEAttentionLogits.");
-  }
-
-  // rpeType:    Q            | K            | V
-  // rpeInput:   [B, Q, H, D] | [B, K, H, D] | [B, H, Q, K]
-  // rpeWeights: [H, Q, K, D] | [H, K, Q, D] | [H, Q, D, K]
-  // attnInput:  [B, H, Q, K] | [B, H, Q, K] | [B, Q, H, D]
-
-  // int lda = (rpetype == 2) ? K : D;
-  // if (lda > 64 || rpetype != 0) {
-#if 1
-  // 3D block structure where x-axis maps to K (or D for rpetype==2), y-axis to
-  // Q and z-axis to BH. Each thread calculates the vector sum-product for the
-  // cube at BHQK | BHQD (i.e. "d,dk->k" | "d,dq->q" | "k,kd->d").
-  dim3 blockDim, gridDim;
-  int X = rpetype == 2 ? D : K;
-  blockDim.x = std::min(32, X);
-  blockDim.y = std::min(16, Q);
-  blockDim.z = std::min(std::max(512 / (blockDim.x * blockDim.y), 1u),
-                        (unsigned int)(B * H));
-  gridDim.x = DivUp(X * kNumRpeKernelSplits, blockDim.x);
-  gridDim.y = DivUp(Q, blockDim.y);
-  gridDim.z = DivUp(B * H, blockDim.z);
-
-  rpeVectorMultiply_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-      rpeInput, rpeWeights, attnInput, output, B, H, Q, K, D, outScale,
-      rpetype);
-#else
-  // } else {
-  // 3D block structure where x-axis maps to D (or K for rpetype==2), y-axis
-  // maps to K (or D for rpetype==2) and z-axis to BQH. Each thread calculates
-  // the product while the warp-sum does the sum of the vector dot-product.
-  dim3 blockDim, gridDim;
-  int Y = rpetype == 2 ? D : K;
-  blockDim.x = std::min(64, lda);
-  blockDim.y = std::min(DivUp(1024, blockDim.x), Y);
-  blockDim.z = std::max(1024 / (blockDim.x * blockDim.y), 1u);
-  gridDim.x = 1;
-  gridDim.y = DivUp(Y, blockDim.y);
-  gridDim.z = DivUp(B * H * Q, blockDim.z);
-
-  rpeVectorMultiply_parallel_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-      rpeInput, rpeWeights, attnInput, output, B, H, Q, K, D, outScale,
-      rpetype);
-#endif
-  // }
-  ReportCUDAErrors(cudaGetLastError());
-}
-
-template <typename T>
-__global__ void rpeQK_multiply_kernel(const T* rpeInputQ, const T* rpeWeightsQ,
-                                      const T* rpeInputK, const T* rpeWeightsK,
-                                      const T* skipAdd, T* output, int B, int H,
-                                      int Q, int K, int D, float outScale) {
-  // Fused version of rpeVectorMultiply_kernel for RPE-Q and RPE-K.
-  const int x = threadIdx.x + blockDim.x * blockIdx.x;
-  const int q = threadIdx.y + blockDim.y * blockIdx.y;
-  const int bh = threadIdx.z + blockDim.z * blockIdx.z;
-  const int h = bh % H;
-  const int b = bh / H;
-  const bool fp16 = std::is_same<half, T>::value;
-  const int lane = x & (kNumRpeKernelSplits - 1);
-
-  // Read tensors per the input layouts and write out per the output layout.
-  // Sum is along the D dimension, and K is on the x-axis.
-  int k = x / kNumRpeKernelSplits;
-  if (b >= B || h >= H || q >= Q || k >= K) return;
-
-  // RPE-Q sum
-  const int tidxq = getTensorIndex(b, q, h, 0, B, Q, H, D);
-  const int widxq = getTensorIndex(h, q, k, 0, H, Q, K, D);
-  T sum1 = dotProductSum(x, rpeInputQ + tidxq, rpeWeightsQ + widxq, D, fp16);
-
-  // RPE-K sum.
-  const int tidxk = getTensorIndex(b, k, h, 0, B, K, H, D);
-  const int widxk = getTensorIndex(h, k, q, 0, H, K, Q, D);
-  T sum2 = dotProductSum(x, rpeInputK + tidxk, rpeWeightsK + widxk, D, fp16);
-
-  // Write out the result.
-  if (lane == 0) {
-    int outIdx = getTensorIndex(b, h, q, k, B, H, Q, K);
-    output[outIdx] = (T)(sum1 + sum2 + skipAdd[outIdx]) * (T)outScale;
-  }
-}
-
-template <typename T>
-void multiplyRpeQKLogits(const T* rpeInputQ, const T* rpeWeightsQ,
-                         const T* rpeInputK, const T* rpeWeightsK,
-                         const T* attnInput, T* output, int B, int H, int Q,
-                         int K, int D, float outScale, cudaStream_t stream) {
-  // rpeType:    Q            | K
-  // rpeInput:   [B, Q, H, D] | [B, K, H, D]
-  // rpeWeights: [H, Q, K, D] | [H, K, Q, D]
-  // attnInput:  [B, H, Q, K] | [B, H, Q, K]
-  dim3 blockDim, gridDim;
-  blockDim.x = std::min(32, K);
-  blockDim.y = std::min(16, Q);
-  blockDim.z = std::min(std::max(512 / (blockDim.x * blockDim.y), 1u),
-                        (unsigned int)(B * H));
-  gridDim.x = DivUp(K * kNumRpeKernelSplits, blockDim.x);
-  gridDim.y = DivUp(Q, blockDim.y);
-  gridDim.z = DivUp(B * H, blockDim.z);
-
-  rpeQK_multiply_kernel<T><<<gridDim, blockDim, 0, stream>>>(
-      rpeInputQ, rpeWeightsQ, rpeInputK, rpeWeightsK, attnInput, output, B, H,
-      Q, K, D, outScale);
-
-  ReportCUDAErrors(cudaGetLastError());
+void multiplyRpeQKLogits(cublasHandle_t handle, const T* rpeInputQ,
+                         const T* rpeWeightsQ, const T* rpeInputK,
+                         const T* rpeWeightsK, const T* attnInput, T* output,
+                         T* scratch, int B, int H, int Q, int K, int D,
+                         float outScale, cudaStream_t stream) {
+  multiplyRPEAttentionLogits(handle, rpeInputQ, rpeWeightsQ, attnInput, output,
+                             scratch, B, H, Q, K, D, outScale, 0, stream);
+  multiplyRPEAttentionLogits(handle, rpeInputK, rpeWeightsK, attnInput, output,
+                             scratch, B, H, Q, K, D, outScale, 1, stream);
 }
 
 template <typename T>
@@ -2029,24 +1768,26 @@ template void applyInputGating<float>(float* output, const float* input,
                                       cudaStream_t stream);
 
 template void multiplyRPEAttentionLogits<half>(
-    const half* rpeInput, const half* rpeWeights, const half* attnInput,
-    half* output, int B, int H, int Q, int K, int D, float outScale,
-    size_t rpetype, cudaStream_t stream);
+    cublasHandle_t handle, const half* rpeInput, const half* rpeWeights,
+    const half* attnInput, half* output, half* scratch, int B, int H, int Q,
+    int K, int D, float outScale, size_t rpetype, cudaStream_t stream);
 
 template void multiplyRPEAttentionLogits<float>(
-    const float* rpeInput, const float* rpeWeights, const float* attnInput,
-    float* output, int B, int H, int Q, int K, int D, float outScale,
-    size_t rpetype, cudaStream_t stream);
+    cublasHandle_t handle, const float* rpeInput, const float* rpeWeights,
+    const float* attnInput, float* output, float* scratch, int B, int H, int Q,
+    int K, int D, float outScale, size_t rpetype, cudaStream_t stream);
 
 template void multiplyRpeQKLogits<half>(
-    const half* rpeInputQ, const half* rpeWeightsQ, const half* rpeInputK,
-    const half* rpeWeightsK, const half* attnInput, half* output, int B, int H,
-    int Q, int K, int D, float outScale, cudaStream_t stream);
+    cublasHandle_t handle, const half* rpeInputQ, const half* rpeWeightsQ,
+    const half* rpeInputK, const half* rpeWeightsK, const half* attnInput,
+    half* output, half* scratch, int B, int H, int Q, int K, int D,
+    float outScale, cudaStream_t stream);
 
 template void multiplyRpeQKLogits<float>(
-    const float* rpeInputQ, const float* rpeWeightsQ, const float* rpeInputK,
-    const float* rpeWeightsK, const float* attnInput, float* output, int B,
-    int H, int Q, int K, int D, float outScale, cudaStream_t stream);
+    cublasHandle_t handle, const float* rpeInputQ, const float* rpeWeightsQ,
+    const float* rpeInputK, const float* rpeWeightsK, const float* attnInput,
+    float* output, float* scratch, int B, int H, int Q, int K, int D,
+    float outScale, cudaStream_t stream);
 
 template void permuteTensor<half>(half* output, const half* input, int s1,
                                   int s2, int s3, int s4, int p1, int p2,
