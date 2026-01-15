@@ -1334,6 +1334,25 @@ void cublasXGemmStridedBatched(cublasHandle_t handle, cublasOperation_t transa,
 }
 
 template <typename T>
+void cublasXGemmBatched(cublasHandle_t handle, cublasOperation_t transa,
+                        cublasOperation_t transb, int m, int n, int k,
+                        float alpha, const T** A, int lda, const T** B, int ldb,
+                        float beta, T** C, int ldc, int batchCount) {
+  const bool fp16 = std::is_same<half, T>::value;
+  if (fp16) {
+    ReportCUBLASErrors(cublasGemmBatchedEx(
+        handle, transa, transb, m, n, k, &alpha, (const void**)A, CUDA_R_16F,
+        lda, (const void**)B, CUDA_R_16F, ldb, &beta, (void**)C, CUDA_R_16F,
+        ldc, batchCount, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
+  } else {
+    ReportCUBLASErrors(cublasGemmBatchedEx(
+        handle, transa, transb, m, n, k, &alpha, (const void**)A, CUDA_R_32F,
+        lda, (const void**)B, CUDA_R_32F, ldb, &beta, (void**)C, CUDA_R_32F,
+        ldc, batchCount, CUDA_R_32F, CUBLAS_GEMM_DEFAULT));
+  }
+}
+
+template <typename T>
 __global__ void permuteAndAdd_kernel(T* output, const T* input, int s1, int s2,
                                      int s3, int s4, int p1, int p2, int p3,
                                      int p4, float scale) {
@@ -1377,38 +1396,94 @@ void permuteAndAdd(T* output, const T* input, int s1, int s2, int s3, int s4,
 }
 
 template <typename T>
+__global__ void generateRpeKPointers_kernel(const T* rpeWeights,
+                                            const T* rpeInput, T* output,
+                                            const T** ptrA, const T** ptrB,
+                                            T** ptrC, int H, int Q, int K,
+                                            int D) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_batches = H * Q * K;
+  if (idx >= total_batches) return;
+
+  // idx = h * (Q*K) + q * K + k
+  // h is outer, q middle, k inner.
+  int k = idx % K;
+  int tmp = idx / K;
+  int q = tmp % Q;
+  int h = tmp / Q;
+
+  // Pointer A (rpeWeights): [H, Q, K, D] (Modified layout)
+  // We need slice D.
+  // Offset = h * (Q*K*D) + q * (K*D) + k * D.
+  ptrA[idx] = rpeWeights + (h * Q * K * D + q * K * D + k * D);
+
+  // Pointer B (rpeInput / mha_k): [N, K, H, D]
+  // We need slice D x N.
+  // We pass base pointer to Batched GEMM.
+  // mha_k for specific k, h.
+  // Offset = k * (H*D) + h * D.
+  // GEMM will use ldb = K*H*D to skip N columns.
+  ptrB[idx] = rpeInput + (k * H * D + h * D);
+
+  // Pointer C (output / buffer1): [N, H, Q, K]
+  // We need slice 1 x N.
+  // Offset = h * (Q*K) + q * K + k.
+  ptrC[idx] = output + (h * Q * K + q * K + k);
+}
+
+template <typename T>
+void generateRpeKPointers(const T* rpeWeights, const T* rpeInput, T* output,
+                          const T** ptrA, const T** ptrB, T** ptrC, int H,
+                          int Q, int K, int D, int N, cudaStream_t stream) {
+  int total = H * Q * K;
+  int blockSize = 256;
+  int gridSize = DivUp(total, blockSize);
+  generateRpeKPointers_kernel<<<gridSize, blockSize, 0, stream>>>(
+      rpeWeights, rpeInput, output, ptrA, ptrB, ptrC, H, Q, K, D);
+  ReportCUDAErrors(cudaGetLastError());
+}
+
+template <typename T>
 void multiplyRPEAttentionLogits(cublasHandle_t handle, const T* rpeInput,
                                 const T* rpeWeights, const T* attnInput,
                                 T* output, T* scratch, int B, int H, int Q,
                                 int K, int D, float outScale, size_t rpetype,
-                                cudaStream_t stream) {
+                                cudaStream_t stream, const T** ptrA,
+                                const T** ptrB, T** ptrC) {
+  float alpha = outScale;
+  float beta = 1.0f;
+
   if (rpetype == 0) {
-    // Q * H batching
-    cublasXGemmStridedBatched<T>(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N, K, B, D, outScale, rpeWeights, D,
-        (long long)K * D, rpeInput, (long long)Q * H * D, (long long)D, 0.0f,
-        scratch, K, (long long)B * K, Q * H);
+    // RPE Q
+    for (int h = 0; h < H; ++h) {
+      const T* A = rpeWeights + h * K * D;
+      const T* B_mat = rpeInput + h * D;
+      T* C = output + h * Q * K;
 
-    // Permute scratch [Q, H, B, K] -> [B, H, Q, K]
-    permuteAndAdd(output, scratch, Q, H, B, K, 2, 1, 0, 3, outScale, stream);
+      cublasXGemmStridedBatched<T>(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N, K, B, D, alpha, A, D,
+          (long long)H * K * D, B_mat, (long long)Q * H * D, (long long)H * D,
+          beta, C, (long long)H * Q * K, (long long)K, Q);
+    }
   } else if (rpetype == 2) {
-    // H * Q batching
-    cublasXGemmStridedBatched<T>(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N, D, B, K, outScale, rpeWeights, K,
-        (long long)D * K, rpeInput, (long long)H * Q * K, (long long)K,
-        0.0f, scratch, D, (long long)B * D, H * Q);
+    // RPE V
+    for (int h = 0; h < H; ++h) {
+      const T* A = rpeWeights + h * Q * D * K;
+      const T* B_mat = rpeInput + h * Q * K;
+      T* C = output + h * D;
 
-    // Permute scratch [H, Q, B, D] -> [B, Q, H, D]
-    permuteAndAdd(output, scratch, H, Q, B, D, 2, 1, 0, 3, outScale, stream);
+      cublasXGemmStridedBatched<T>(
+          handle, CUBLAS_OP_T, CUBLAS_OP_T, D, B, K, alpha, A, K,
+          (long long)D * K, B_mat, (long long)H * Q * K, (long long)K, beta,
+          C, (long long)Q * H * D, (long long)H * D, Q);
+    }
   } else if (rpetype == 1) {
-    // K * H batching
-    cublasXGemmStridedBatched<T>(
-        handle, CUBLAS_OP_T, CUBLAS_OP_N, Q, B, D, 1.0f, rpeWeights, D,
-        (long long)Q * D, rpeInput, (long long)K * H * D, (long long)D, 0.0f,
-        scratch, Q, (long long)B * Q, K * H);
-
-    // Permute scratch [K, H, B, Q] -> [B, H, Q, K]
-    permuteAndAdd(output, scratch, K, H, B, Q, 2, 1, 3, 0, outScale, stream);
+    // RPE K
+    generateRpeKPointers(rpeWeights, rpeInput, output, ptrA, ptrB, ptrC, H, Q,
+                         K, D, B, stream);
+    cublasXGemmBatched<T>(handle, CUBLAS_OP_T, CUBLAS_OP_N, 1, B, D, alpha,
+                          ptrA, D, ptrB, (long long)K * H * D, beta, ptrC,
+                          (long long)H * Q * K, H * Q * K);
   }
 }
 
@@ -1417,11 +1492,13 @@ void multiplyRpeQKLogits(cublasHandle_t handle, const T* rpeInputQ,
                          const T* rpeWeightsQ, const T* rpeInputK,
                          const T* rpeWeightsK, const T* attnInput, T* output,
                          T* scratch, int B, int H, int Q, int K, int D,
-                         float outScale, cudaStream_t stream) {
+                         float outScale, cudaStream_t stream, const T** ptrA,
+                         const T** ptrB, T** ptrC) {
   multiplyRPEAttentionLogits(handle, rpeInputQ, rpeWeightsQ, attnInput, output,
                              scratch, B, H, Q, K, D, outScale, 0, stream);
   multiplyRPEAttentionLogits(handle, rpeInputK, rpeWeightsK, attnInput, output,
-                             scratch, B, H, Q, K, D, outScale, 1, stream);
+                             scratch, B, H, Q, K, D, outScale, 1, stream, ptrA,
+                             ptrB, ptrC);
 }
 
 template <typename T>
@@ -1759,27 +1836,41 @@ template void applyInputGating<float>(float* output, const float* input,
                                       int N, int C, int output_size,
                                       cudaStream_t stream);
 
+template void generateRpeKPointers<half>(
+    const half* rpeWeights, const half* rpeInput, half* output,
+    const half** ptrA, const half** ptrB, half** ptrC, int H, int Q, int K,
+    int D, int N, cudaStream_t stream);
+
+template void generateRpeKPointers<float>(
+    const float* rpeWeights, const float* rpeInput, float* output,
+    const float** ptrA, const float** ptrB, float** ptrC, int H, int Q, int K,
+    int D, int N, cudaStream_t stream);
+
 template void multiplyRPEAttentionLogits<half>(
     cublasHandle_t handle, const half* rpeInput, const half* rpeWeights,
     const half* attnInput, half* output, half* scratch, int B, int H, int Q,
-    int K, int D, float outScale, size_t rpetype, cudaStream_t stream);
+    int K, int D, float outScale, size_t rpetype, cudaStream_t stream,
+    const half** ptrA, const half** ptrB, half** ptrC);
 
 template void multiplyRPEAttentionLogits<float>(
     cublasHandle_t handle, const float* rpeInput, const float* rpeWeights,
     const float* attnInput, float* output, float* scratch, int B, int H, int Q,
-    int K, int D, float outScale, size_t rpetype, cudaStream_t stream);
+    int K, int D, float outScale, size_t rpetype, cudaStream_t stream,
+    const float** ptrA, const float** ptrB, float** ptrC);
 
 template void multiplyRpeQKLogits<half>(
     cublasHandle_t handle, const half* rpeInputQ, const half* rpeWeightsQ,
     const half* rpeInputK, const half* rpeWeightsK, const half* attnInput,
     half* output, half* scratch, int B, int H, int Q, int K, int D,
-    float outScale, cudaStream_t stream);
+    float outScale, cudaStream_t stream, const half** ptrA, const half** ptrB,
+    half** ptrC);
 
 template void multiplyRpeQKLogits<float>(
     cublasHandle_t handle, const float* rpeInputQ, const float* rpeWeightsQ,
     const float* rpeInputK, const float* rpeWeightsK, const float* attnInput,
     float* output, float* scratch, int B, int H, int Q, int K, int D,
-    float outScale, cudaStream_t stream);
+    float outScale, cudaStream_t stream, const float** ptrA, const float** ptrB,
+    float** ptrC);
 
 template void permuteTensor<half>(half* output, const half* input, int s1,
                                   int s2, int s3, int s4, int p1, int p2,
