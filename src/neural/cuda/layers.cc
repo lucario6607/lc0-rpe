@@ -1928,9 +1928,10 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
       // BQHD/BKHD. mha_q @ rpe_q: [B, Q, H, D] x [D, H, Q, K] mha_k @ rpe_k:
       // [B, K, H, D] x [D, H, Q, K] Kernel performs the required
       // transpositions.
-      multiplyRpeQKLogits<DataType>(mha_q, mha_rpe_q, mha_k, mha_rpe_k, buffer1,
-                                    buffer1, N, encoder_heads_, 64, 64, depth,
-                                    factor, stream);
+      multiplyRpeQKLogits<DataType>(cublas, mha_q, mha_rpe_q, mha_k, mha_rpe_k,
+                                    buffer1, buffer1, buffer2, N,
+                                    encoder_heads_, 64, 64, depth, factor,
+                                    stream);
     } else {
       // RPE Q.
       if (mha_rpe_q_size_ > 0) {
@@ -1939,9 +1940,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         // mha_q @ rpe_q: [B, Q, H, D] x [D, H, Q, K]
         // Kernel performs the required transpositions.
         float outScale = mha_rpe_k_size_ == 0 ? factor : 1.0f;
-        multiplyRPEAttentionLogits<DataType>(mha_q, mha_rpe_q, buffer1, buffer1,
-                                             N, encoder_heads_, 64, 64, depth,
-                                             outScale, 0, stream);
+        multiplyRPEAttentionLogits<DataType>(
+            cublas, mha_q, mha_rpe_q, buffer1, buffer1, buffer2, N,
+            encoder_heads_, 64, 64, depth, outScale, 0, stream);
       }
       // RPE K.
       if (mha_rpe_k_size_ > 0) {
@@ -1949,9 +1950,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
         // Note: mha_k here is not yet transposed, so shape is still BKHD.
         // mha_k @ rpe_k: [B, K, H, D] x [D, H, Q, K]
         // Kernel performs the required transpositions.
-        multiplyRPEAttentionLogits<DataType>(mha_k, mha_rpe_k, buffer1, buffer1,
-                                             N, encoder_heads_, 64, 64, depth,
-                                             factor, 1, stream);
+        multiplyRPEAttentionLogits<DataType>(
+            cublas, mha_k, mha_rpe_k, buffer1, buffer1, buffer2, N,
+            encoder_heads_, 64, 64, depth, factor, 1, stream);
       }
     }
   }
@@ -1991,9 +1992,9 @@ void EncoderBlock<DataType>::Eval(int N, DataType* in_out_tensor,
     // attn @ rpe_v: [B, H, Q, K] x [D, H, Q, K]
     // Kernel performs the required transpositions.
     // The matmul result (buffer2) is already with BQHD shape.
-    multiplyRPEAttentionLogits<DataType>(buffer1, mha_rpe_v, buffer2, buffer2,
-                                         N, encoder_heads_, 64, 64, depth, 1.0f,
-                                         2, stream);
+    multiplyRPEAttentionLogits<DataType>(cublas, buffer1, mha_rpe_v, buffer2,
+                                         buffer2, nullptr, N, encoder_heads_,
+                                         64, 64, depth, 1.0f, 2, stream);
   }
 
   // #final dense layer (mha_dense), buffer2 -> buffer1
