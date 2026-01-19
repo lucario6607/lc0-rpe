@@ -1383,40 +1383,32 @@ void multiplyRPEAttentionLogits(cublasHandle_t handle, const T* rpeInput,
                                 int K, int D, float outScale, size_t rpetype,
                                 cudaStream_t stream) {
   if (rpetype == 0) {
-    for (int q = 0; q < Q; q++) {
-      const T* A_ptr = rpeInput + q * H * D;
-      const T* B_ptr = rpeWeights + q * K * D;
-      T* C_ptr = output + q * K;
+    // Q * H batching
+    cublasXGemmStridedBatched<T>(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, K, B, D, outScale, rpeWeights, D,
+        (long long)K * D, rpeInput, (long long)Q * H * D, (long long)D, 0.0f,
+        scratch, K, (long long)B * K, Q * H);
 
-      cublasXGemmStridedBatched<T>(
-          handle, CUBLAS_OP_T, CUBLAS_OP_N, K, B, D, outScale, B_ptr, D,
-          (long long)Q * K * D, A_ptr, (long long)Q * H * D, D, outScale, C_ptr,
-          (long long)H * Q * K, (long long)Q * K, H);
-    }
+    // Permute scratch [Q, H, B, K] -> [B, H, Q, K]
+    permuteAndAdd(output, scratch, Q, H, B, K, 2, 1, 0, 3, outScale, stream);
   } else if (rpetype == 2) {
-    for (int q = 0; q < Q; q++) {
-      const T* A_ptr = rpeInput + q * K;
-      const T* B_ptr = rpeWeights + q * D * K;
-      T* C_ptr = output + q * H * D;
+    // H * Q batching
+    cublasXGemmStridedBatched<T>(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, D, B, K, outScale, rpeWeights, K,
+        (long long)D * K, rpeInput, (long long)H * Q * K, (long long)K,
+        0.0f, scratch, D, (long long)B * D, H * Q);
 
-      cublasXGemmStridedBatched<T>(
-          handle, CUBLAS_OP_T, CUBLAS_OP_N, D, B, K, outScale, B_ptr, K,
-          (long long)Q * D * K, A_ptr, (long long)H * Q * K, (long long)Q * K,
-          outScale, C_ptr, (long long)Q * H * D, D, H);
-    }
+    // Permute scratch [H, Q, B, D] -> [B, Q, H, D]
+    permuteAndAdd(output, scratch, H, Q, B, D, 2, 1, 0, 3, outScale, stream);
   } else if (rpetype == 1) {
-    for (int h = 0; h < H; h++) {
-      const T* A_ptr = rpeInput + h * D;
-      const T* B_ptr = rpeWeights + h * K * Q * D;
-      T* C_ptr = scratch + h * K * B * Q;
+    // K * H batching
+    cublasXGemmStridedBatched<T>(
+        handle, CUBLAS_OP_T, CUBLAS_OP_N, Q, B, D, 1.0f, rpeWeights, D,
+        (long long)Q * D, rpeInput, (long long)K * H * D, (long long)D, 0.0f,
+        scratch, Q, (long long)B * Q, K * H);
 
-      cublasXGemmStridedBatched<T>(
-          handle, CUBLAS_OP_T, CUBLAS_OP_N, Q, B, D, 1.0f, B_ptr, D,
-          (long long)Q * D, A_ptr, (long long)K * H * D, (long long)H * D, 0.0f,
-          C_ptr, Q, (long long)B * Q, K);
-    }
-
-    permuteAndAdd(output, scratch, H, K, B, Q, 2, 0, 3, 1, outScale, stream);
+    // Permute scratch [K, H, B, Q] -> [B, H, Q, K]
+    permuteAndAdd(output, scratch, K, H, B, Q, 2, 1, 3, 0, outScale, stream);
   }
 }
 
